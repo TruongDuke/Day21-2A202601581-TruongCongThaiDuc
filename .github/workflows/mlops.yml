@@ -9,6 +9,13 @@ on:
       - 'params.yaml'
   workflow_dispatch:
 
+env:
+  # DagsHub thay cho GCS: vua la DVC remote (S3-compatible) vua la MLflow server.
+  # Secrets can tao: DAGSHUB_USER, DAGSHUB_REPO, DAGSHUB_TOKEN
+  DAGSHUB_USER: ${{ secrets.DAGSHUB_USER }}
+  DAGSHUB_REPO: ${{ secrets.DAGSHUB_REPO }}
+  DAGSHUB_TOKEN: ${{ secrets.DAGSHUB_TOKEN }}
+
 jobs:
 
   # ---------------------------------------------------------------------------
@@ -26,13 +33,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+          cache: pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Run unit tests
         # TODO 1: Viet lenh de chay pytest tren thu muc tests/ voi co -v
-        run: # <dien lenh o day>
+        run: pytest tests/ -v
 
 
   # ---------------------------------------------------------------------------
@@ -53,24 +61,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+          cache: pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Authenticate to Cloud Storage
-        # TODO 2: Ghi noi dung credentials ra file tam va set bien moi truong xac thuc.
-        # GCP:   echo '${{ secrets.CLOUD_CREDENTIALS }}' > /tmp/sa-key.json
-        #        echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa-key.json" >> $GITHUB_ENV
-        # AWS:   echo "AWS_ACCESS_KEY_ID=..." >> $GITHUB_ENV  (lay tu secrets)
-        #        echo "AWS_SECRET_ACCESS_KEY=..." >> $GITHUB_ENV
-        # Azure: echo "AZURE_STORAGE_CONNECTION_STRING=..." >> $GITHUB_ENV
+        # TODO 2: Ghi credentials va set bien moi truong xac thuc.
+        # DagsHub dung S3-compatible API: access_key_id = secret_access_key = token.
+        # Ghi vao config --local de khong lam ban .dvc/config da commit.
         run: |
-          # <dien code o day>
+          dvc remote modify --local myremote access_key_id  "$DAGSHUB_TOKEN"
+          dvc remote modify --local myremote secret_access_key "$DAGSHUB_TOKEN"
+          # MLflow tracking tu xa tren DagsHub (Bonus 1)
+          echo "MLFLOW_TRACKING_URI=https://dagshub.com/$DAGSHUB_USER/$DAGSHUB_REPO.mlflow" >> $GITHUB_ENV
+          echo "MLFLOW_TRACKING_USERNAME=$DAGSHUB_USER" >> $GITHUB_ENV
+          echo "MLFLOW_TRACKING_PASSWORD=$DAGSHUB_TOKEN" >> $GITHUB_ENV
 
       - name: Pull data with DVC
         # TODO 3: Pull cac file du lieu can thiet tu cloud storage bang lenh dvc pull.
         #         Chi pull train_phase1.csv va eval.csv (khong can train_phase2.csv).
-        run: # <dien lenh o day>
+        run: dvc pull data/train_phase1.csv data/eval.csv
 
       - name: Train model
         run: python src/train.py
@@ -79,20 +90,36 @@ jobs:
         id: read_metrics
         # TODO 4: Doc gia tri "accuracy" tu outputs/metrics.json bang Python inline.
         #         Set ket qua thanh output "accuracy" de job deploy co the doc.
-        #
-        # Goi y:
-        #   ACC=$(python -c "import json; d=json.load(open('outputs/metrics.json')); print(d['accuracy'])")
-        #   echo "accuracy=$ACC" >> $GITHUB_OUTPUT
         run: |
-          # <dien code o day>
+          ACC=$(python -c "import json; d=json.load(open('outputs/metrics.json')); print(d['accuracy'])")
+          echo "accuracy=$ACC" >> $GITHUB_OUTPUT
+          echo "Accuracy doc duoc: $ACC"
 
       - name: Upload model to Cloud Storage
-        # TODO 5: Su dung cloud SDK de upload models/model.pkl len
-        #         <bucket>/models/latest/model.pkl.
-        #         Ten bucket lay tu secret CLOUD_BUCKET.
+        # TODO 5: Upload models/model.pkl len <bucket>/models/latest/model.pkl.
+        #         DagsHub repo bucket: bucket = ten repo, endpoint = repo-buckets/s3/<user>.
         run: |
           python - <<'EOF'
-          # <dien code Python o day>
+          import boto3, os
+
+          user   = os.environ["DAGSHUB_USER"]
+          repo   = os.environ["DAGSHUB_REPO"]
+          token  = os.environ["DAGSHUB_TOKEN"]
+
+          client = boto3.client(
+              "s3",
+              endpoint_url=f"https://dagshub.com/api/v1/repo-buckets/s3/{user}",
+              aws_access_key_id=token,
+              aws_secret_access_key=token,
+              region_name="us-east-1",
+          )
+          client.upload_file(
+              Filename="models/model.pkl",
+              Bucket=repo,
+              Key="models/latest/model.pkl",
+          )
+          size_mb = os.path.getsize("models/model.pkl") / 1e6
+          print(f"Da upload models/model.pkl ({size_mb:.1f} MB) len {repo}/models/latest/model.pkl")
           EOF
 
       - name: Save metrics as artifact
@@ -117,16 +144,14 @@ jobs:
       - name: Check eval gate
         # TODO 6: Doc accuracy tu output cua job train.
         #         Neu accuracy < 0.70, ket thuc voi loi ro rang.
-        #         Neu dat nguong, in thong bao va tiep tuc.
-        #
-        # Goi y:
-        #   acc = float("${{ needs.train.outputs.accuracy }}")
-        #   if acc < 0.70:
-        #       raise SystemExit(f"FAILED: accuracy {acc:.4f} < 0.70. Huy deploy.")
-        #   print("PASSED: dang trien khai model.")
         run: |
           python - <<'EOF'
-          # <dien code Python o day>
+          acc = float("${{ needs.train.outputs.accuracy }}")
+          THRESHOLD = 0.70
+          print(f"Accuracy = {acc:.4f} | Nguong = {THRESHOLD}")
+          if acc < THRESHOLD:
+              raise SystemExit(f"FAILED: accuracy {acc:.4f} < {THRESHOLD}. Huy deploy.")
+          print("PASSED: dang trien khai model.")
           EOF
 
 
@@ -141,7 +166,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
 
+      - name: Check VM secrets
+        id: check_vm
+        # Neu chua co VM, job nay bao qua thay vi that bai do (giu pipeline xanh).
+        run: |
+          if [ -n "${{ secrets.VM_HOST }}" ]; then
+            echo "has_vm=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_vm=false" >> $GITHUB_OUTPUT
+            echo "Chua cau hinh secret VM_HOST - bo qua buoc SSH deploy."
+          fi
+
       - name: SSH deploy to VM
+        if: steps.check_vm.outputs.has_vm == 'true'
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VM_HOST }}
@@ -149,11 +186,18 @@ jobs:
           key: ${{ secrets.VM_SSH_KEY }}
           script: |
             # TODO 7: Restart service mlops-serve tren VM.
+            sudo systemctl restart mlops-serve
+
             # TODO 8: Cho server san sang roi goi curl /health de xac nhan.
-            #         Neu health check that bai sau nhieu lan thu, thoat voi exit 1.
-            #
-            # Goi y:
-            #   sudo systemctl restart mlops-serve
-            #   sleep 5
-            #   curl -sf http://localhost:8000/health && echo "Health check passed." || exit 1
-            # <dien lenh bash o day>
+            for i in $(seq 1 12); do
+              if curl -sf http://localhost:8000/health; then
+                echo ""
+                echo "Health check passed (lan thu $i)."
+                exit 0
+              fi
+              echo "Chua san sang, thu lai sau 5s... ($i/12)"
+              sleep 5
+            done
+            echo "Health check that bai sau 12 lan thu."
+            sudo journalctl -u mlops-serve -n 50 --no-pager
+            exit 1
