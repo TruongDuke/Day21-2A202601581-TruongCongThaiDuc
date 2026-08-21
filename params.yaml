@@ -10,3 +10,5 @@ min_samples_split: 5
 
 # Bonus 2: chon thuat toan - random_forest | gradient_boosting | logistic_regression
 model_type: random_forest
+
+# Buoc 3: huan luyen tren 5996 mau (phase1 + phase2)
