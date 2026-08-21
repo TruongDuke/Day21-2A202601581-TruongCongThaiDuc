@@ -74,7 +74,9 @@ Quy trình DVC vẫn nguyên vẹn: `dvc add` → `dvc push` → `dvc pull` tron
 | HistGradientBoosting | 0.6600 |
 | GradientBoosting | 0.6020 |
 
-*Kết luận:* giới hạn nằm ở **lượng dữ liệu**, không ở thuật toán hay siêu tham số. Khi bổ sung `train_phase2.csv` ở Bước 3 (2998 → 5996 mẫu), accuracy nhảy lên **0.746** mà không đổi một siêu tham số nào. Đây chính là điều lab muốn minh chứng: ở Bước 2 eval gate **chặn** deploy đúng như thiết kế, và chỉ dữ liệu mới mới mở được cổng đó — lý do tồn tại của continuous training.
+*Kết luận:* giới hạn nằm ở **lượng dữ liệu**, không ở thuật toán hay siêu tham số. Khi bổ sung `train_phase2.csv` ở Bước 3 (2998 → 5996 mẫu), accuracy nhảy lên **0.7500** mà không đổi một siêu tham số nào. Đây chính là điều lab muốn minh chứng: ở Bước 2 eval gate **chặn** deploy đúng như thiết kế, và chỉ dữ liệu mới mới mở được cổng đó — lý do tồn tại của continuous training.
+
+(Đo cục bộ trên macOS cho 0.7460, CI trên Ubuntu cho 0.7500 — lệch 2 mẫu trên 500 do khác nền tảng và thứ tự luồng trong RandomForest.)
 
 **c. Unit test fail không ổn định (`MissingConfigException`).** Test pass khi chạy riêng nhưng fail sau khi chạy `python src/train.py`.
 
@@ -90,7 +92,33 @@ Quy trình DVC vẫn nguyên vẹn: `dvc add` → `dvc push` → `dvc pull` tron
 
 ---
 
-## 3. Tóm tắt kết quả
+## 3. Bằng chứng pipeline chạy thật
+
+Hai lần chạy trên GitHub Actions minh chứng đầy đủ vòng continuous training:
+
+**Bước 2** — [run 32456187742](https://github.com/TruongDuke/Day21-2A202601581-TruongCongThaiDuc/actions/runs/32456187742), huấn luyện trên 2998 mẫu:
+
+| Job | Kết quả |
+|---|---|
+| Unit Test | success |
+| Train | success — accuracy 0.6800 |
+| Eval | **failure** — `FAILED: huy deploy vi accuracy 0.6800 < nguong 0.7` |
+| Deploy | skipped |
+
+**Bước 3** — [run 32456566223](https://github.com/TruongDuke/Day21-2A202601581-TruongCongThaiDuc/actions/runs/32456566223), kích hoạt tự động bởi một `git push` chứa con trỏ DVC mới:
+
+| Job | Kết quả |
+|---|---|
+| Unit Test | success |
+| Train | success — `dvc pull` lấy 5996 mẫu, accuracy 0.7500 |
+| Eval | success — `Accuracy cu: 0.6800 (thay doi: +0.0700)` → PASSED |
+| Deploy | success — `{"status":"ok"}`, `/predict` trả nhãn hợp lệ, 3 đặc trưng → HTTP 400 |
+
+Bonus 4 được xác nhận chạy thật: job Eval của Bước 3 đọc được `PREV_ACC: 0.68` từ cache của lần chạy trước và so sánh trước khi cho deploy.
+
+---
+
+## 4. Tóm tắt kết quả
 
 | Hạng mục | Trạng thái |
 |---|---|
@@ -98,5 +126,6 @@ Quy trình DVC vẫn nguyên vẹn: `dvc add` → `dvc push` → `dvc pull` tron
 | Unit test (3 test) | Pass, ổn định trong 3 môi trường |
 | DVC remote (`./dvcstore`) | Đã cấu hình, `dvc pull` chạy trong CI |
 | CI/CD 4 jobs | Test → Train → Eval → Deploy, không cần tài khoản cloud |
-| Eval gate | Chặn đúng ở 0.68 < 0.70 |
-| Bonus 1–5 | Hoàn thành |
+| Eval gate | Chặn đúng ở 0.68 < 0.70, mở ở 0.75 |
+| Bonus 1–5 | Hoàn thành (Bonus 4 xác nhận trên CI) |
+| Bước 3 - tự động hóa | 1 push kích hoạt cả 4 jobs, không tác động thủ công |

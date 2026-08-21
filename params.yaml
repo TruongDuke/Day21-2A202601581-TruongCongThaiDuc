@@ -1,7 +1,7 @@
 # Sieu tham so cho mo hinh RandomForestClassifier
 # Bo tham so tot nhat chon o Buoc 1.
 # accuracy = 0.6800 tren eval.csv voi train_phase1.csv (2998 mau)
-# accuracy = 0.7460 sau khi bo sung train_phase2.csv o Buoc 3 (5996 mau)
+# accuracy = 0.7500 sau khi bo sung train_phase2.csv o Buoc 3 (5996 mau, do tren CI)
 # Chon 500 cay thay vi 1000 (acc 0.6840): chenh lech 0.004 la nhieu thong ke,
 # nhung model.pkl giam tu 114MB xuong 43MB - quan trong khi upload CI va load tren VM.
 n_estimators: 500
