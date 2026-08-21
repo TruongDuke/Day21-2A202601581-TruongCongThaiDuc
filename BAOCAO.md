@@ -118,7 +118,19 @@ Bonus 4 được xác nhận chạy thật: job Eval của Bước 3 đọc đư
 
 ---
 
-## 4. Tóm tắt kết quả
+## 4. Ảnh chụp minh chứng
+
+| Minh chứng | Ảnh |
+|---|---|
+| MLflow UI — 22 run, sort theo accuracy | ![MLflow UI](screenshots/01-mlflow-ui.png) |
+| Bước 2 — eval gate chặn deploy | ![Actions Bước 2](screenshots/02-actions-buoc2-eval-chan.png) |
+| Bước 3 — cả 4 jobs xanh | ![Actions Bước 3](screenshots/03-actions-buoc3-4-jobs-xanh.png) |
+| Endpoint `/health` và `/predict` | ![curl](screenshots/04-curl-health-predict.png) |
+| Dữ liệu và model đã lưu | ![storage](screenshots/05-dvc-storage.png) |
+
+---
+
+## 5. Tóm tắt kết quả
 
 | Hạng mục | Trạng thái |
 |---|---|
