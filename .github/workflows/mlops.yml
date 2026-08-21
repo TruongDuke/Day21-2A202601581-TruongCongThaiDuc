@@ -15,6 +15,7 @@ env:
   DAGSHUB_USER: ${{ secrets.DAGSHUB_USER }}
   DAGSHUB_REPO: ${{ secrets.DAGSHUB_REPO }}
   DAGSHUB_TOKEN: ${{ secrets.DAGSHUB_TOKEN }}
+  EVAL_THRESHOLD: "0.70"
 
 jobs:
 
@@ -54,6 +55,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       accuracy: ${{ steps.read_metrics.outputs.accuracy }}
+      prev_accuracy: ${{ steps.prev_metrics.outputs.prev_accuracy }}
 
     steps:
       - uses: actions/checkout@v4
@@ -83,6 +85,37 @@ jobs:
         #         Chi pull train_phase1.csv va eval.csv (khong can train_phase2.csv).
         run: dvc pull data/train_phase1.csv data/eval.csv
 
+      - name: Download previous metrics
+        id: prev_metrics
+        # Bonus 4: tai metrics.json cua lan chay truoc de so sanh sau khi train.
+        # Phai lam TRUOC buoc upload, neu khong se doc lai chinh model vua day len.
+        # Lan chay dau tien chua co file -> prev_accuracy de trong, khong coi la loi.
+        run: |
+          python - <<'EOF' >> $GITHUB_OUTPUT
+          import boto3, os, json, sys
+          from botocore.exceptions import ClientError
+
+          user, repo, token = (os.environ["DAGSHUB_USER"],
+                               os.environ["DAGSHUB_REPO"],
+                               os.environ["DAGSHUB_TOKEN"])
+          client = boto3.client(
+              "s3",
+              endpoint_url=f"https://dagshub.com/api/v1/repo-buckets/s3/{user}",
+              aws_access_key_id=token,
+              aws_secret_access_key=token,
+              region_name="us-east-1",
+          )
+          try:
+              obj = client.get_object(Bucket=repo, Key="models/latest/metrics.json")
+              prev = json.loads(obj["Body"].read())
+              print(f"prev_accuracy={prev['accuracy']}")
+              print(f"Tim thay model truoc, accuracy={prev['accuracy']}", file=sys.stderr)
+          except ClientError as e:
+              print("prev_accuracy=")
+              print(f"Chua co model truoc ({e.response['Error']['Code']}) - bo qua so sanh.",
+                    file=sys.stderr)
+          EOF
+
       - name: Train model
         run: python src/train.py
 
@@ -95,17 +128,21 @@ jobs:
           echo "accuracy=$ACC" >> $GITHUB_OUTPUT
           echo "Accuracy doc duoc: $ACC"
 
+      - name: Show performance report
+        # Bonus 3: in bao cao confusion matrix + precision/recall vao log pipeline.
+        run: cat outputs/report.txt
+
       - name: Upload model to Cloud Storage
         # TODO 5: Upload models/model.pkl len <bucket>/models/latest/model.pkl.
         #         DagsHub repo bucket: bucket = ten repo, endpoint = repo-buckets/s3/<user>.
+        #         Upload ca metrics.json de lan chay sau so sanh duoc (Bonus 4).
         run: |
           python - <<'EOF'
           import boto3, os
 
-          user   = os.environ["DAGSHUB_USER"]
-          repo   = os.environ["DAGSHUB_REPO"]
-          token  = os.environ["DAGSHUB_TOKEN"]
-
+          user, repo, token = (os.environ["DAGSHUB_USER"],
+                               os.environ["DAGSHUB_REPO"],
+                               os.environ["DAGSHUB_TOKEN"])
           client = boto3.client(
               "s3",
               endpoint_url=f"https://dagshub.com/api/v1/repo-buckets/s3/{user}",
@@ -113,25 +150,28 @@ jobs:
               aws_secret_access_key=token,
               region_name="us-east-1",
           )
-          client.upload_file(
-              Filename="models/model.pkl",
-              Bucket=repo,
-              Key="models/latest/model.pkl",
-          )
-          size_mb = os.path.getsize("models/model.pkl") / 1e6
-          print(f"Da upload models/model.pkl ({size_mb:.1f} MB) len {repo}/models/latest/model.pkl")
+          for local, key in [
+              ("models/model.pkl",     "models/latest/model.pkl"),
+              ("outputs/metrics.json", "models/latest/metrics.json"),
+              ("outputs/report.txt",   "models/latest/report.txt"),
+          ]:
+              client.upload_file(Filename=local, Bucket=repo, Key=key)
+              print(f"Da upload {local} ({os.path.getsize(local)/1e6:.1f} MB) -> {repo}/{key}")
           EOF
 
       - name: Save metrics as artifact
+        # Bonus 3: luu ca report.txt canh metrics.json.
         uses: actions/upload-artifact@v4
         with:
           name: metrics
-          path: outputs/metrics.json
+          path: |
+            outputs/metrics.json
+            outputs/report.txt
 
 
   # ---------------------------------------------------------------------------
   # JOB 3 - EVAL
-  # Kiem tra nguong chat luong (accuracy >= 0.70).
+  # Kiem tra nguong chat luong (accuracy >= 0.70) va so sanh voi model truoc.
   # Pipeline dung lai o day neu mo hinh chua dat yeu cau.
   # Chi chay khi Job 2 (Train) hoan thanh thanh cong.
   # ---------------------------------------------------------------------------
@@ -144,14 +184,43 @@ jobs:
       - name: Check eval gate
         # TODO 6: Doc accuracy tu output cua job train.
         #         Neu accuracy < 0.70, ket thuc voi loi ro rang.
+        # Bonus 4: ngoai nguong tuyet doi, con chan deploy neu model moi te hon
+        #          model dang chay.
+        env:
+          ACC: ${{ needs.train.outputs.accuracy }}
+          PREV_ACC: ${{ needs.train.outputs.prev_accuracy }}
         run: |
           python - <<'EOF'
-          acc = float("${{ needs.train.outputs.accuracy }}")
-          THRESHOLD = 0.70
-          print(f"Accuracy = {acc:.4f} | Nguong = {THRESHOLD}")
-          if acc < THRESHOLD:
-              raise SystemExit(f"FAILED: accuracy {acc:.4f} < {THRESHOLD}. Huy deploy.")
-          print("PASSED: dang trien khai model.")
+          import os
+
+          acc = float(os.environ["ACC"])
+          threshold = float(os.environ["EVAL_THRESHOLD"])
+          prev_raw = os.environ.get("PREV_ACC", "").strip()
+
+          print(f"Accuracy moi : {acc:.4f}")
+          print(f"Nguong       : {threshold}")
+
+          failures = []
+
+          # Cong 1: nguong chat luong tuyet doi
+          if acc < threshold:
+              failures.append(f"accuracy {acc:.4f} < nguong {threshold}")
+
+          # Cong 2 (Bonus 4): khong duoc kem hon model dang chay
+          if prev_raw:
+              prev = float(prev_raw)
+              delta = acc - prev
+              print(f"Accuracy cu  : {prev:.4f}  (thay doi: {delta:+.4f})")
+              if acc < prev:
+                  failures.append(f"accuracy {acc:.4f} thap hon model dang chay {prev:.4f}")
+          else:
+              print("Accuracy cu  : chua co (day la lan chay dau tien)")
+
+          if failures:
+              print("\nFAILED: huy deploy vi " + "; ".join(failures) + ".")
+              raise SystemExit(1)
+
+          print("\nPASSED: dang trien khai model.")
           EOF
 
 
