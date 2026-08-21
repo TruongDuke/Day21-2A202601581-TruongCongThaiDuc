@@ -50,9 +50,20 @@ model_type: random_forest
 
 ## 2. Khó khăn gặp phải và cách giải quyết
 
-**a. Không đăng ký được tài khoản cloud.** Billing GCP báo lỗi `OR_BACR2_31` (từ chối thẻ), không thể tạo bucket và VM theo hướng dẫn gốc.
+**a. Không đăng ký được tài khoản cloud.** Billing GCP báo lỗi `OR_BACR2_31` (từ chối thẻ) — thẻ bị từ chối ở bước xác thực thanh toán, không thể tạo bucket và VM theo hướng dẫn gốc. AWS và Azure đều cũng yêu cầu thẻ tín dụng.
 
-*Giải pháp:* chuyển sang **DagsHub** — miễn phí, không cần thẻ tín dụng, S3-compatible. Một dịch vụ đóng cả hai vai: DVC remote (`s3://dvc` qua endpoint `dagshub.com/<user>/<repo>.s3`) và MLflow tracking server. Đã đổi `requirements.txt` từ `dvc[gs]`/`google-cloud-storage` sang `dvc[s3]`/`boto3`, và viết `src/serve.py` hỗ trợ ba chế độ tải model: DagsHub → GCS → local fallback. Việc này đồng thời hoàn thành Bonus 1.
+*Giải pháp:* dựng lại toàn bộ pipeline **chỉ trên GitHub**, không cần đăng ký thêm dịch vụ nào:
+
+| Thành phần | Bản gốc | Thay thế |
+|---|---|---|
+| DVC remote | GCS bucket | `./dvcstore` trong repo (392 KB) |
+| Model storage | `gs://.../models/latest/` | GitHub Actions artifacts |
+| Metrics giữa các lần chạy | cloud storage | GitHub Actions cache |
+| VM serving | GCE + systemd + SSH | FastAPI khởi động trên runner |
+
+Quy trình DVC vẫn nguyên vẹn: `dvc add` → `dvc push` → `dvc pull` trong CI đều chạy thật, chỉ khác là remote nằm trong repo thay vì trên cloud. `src/serve.py` được viết hỗ trợ ba chế độ tải model (DagsHub S3 → GCS → local) nên chỉ cần đặt biến môi trường là chuyển sang cloud được, không phải sửa code.
+
+*Hạn chế cần nêu rõ:* rubric yêu cầu "dữ liệu hiển thị trên cloud storage" và "VM trả về kết quả tại endpoint". Phương án này chứng minh đầy đủ về mặt chức năng nhưng không dùng cloud thật, nên hai hạng mục đó (24 điểm) cần giảng viên xác nhận cách chấm.
 
 **b. Không đạt được ngưỡng eval 0.70 ở Bước 2.** Đã thử rất rộng nhưng trần thực sự với 2998 mẫu chỉ là ~0.686:
 
@@ -71,7 +82,11 @@ model_type: random_forest
 
 *Giải pháp:* thêm `tests/conftest.py` với fixture `autouse` trỏ tracking URI vào một thư mục tạm **chưa tồn tại** — điều kiện để `FileStore` bootstrap experiment mặc định. Test giờ chạy giống nhau trên máy cá nhân và trên CI runner, không phụ thuộc biến môi trường hay thư mục sót lại.
 
-**d. Bước "Download previous metrics" đọc ra rỗng (Bonus 4).** Ban đầu tôi `echo` giá trị output ngay trong chính step đặt nó. GitHub Actions đánh giá biểu thức `${{ }}` **trước** khi step chạy, nên luôn ra rỗng. Đã chuyển phần thông báo vào trong Python và ghi ra `stderr`, còn `stdout` dành riêng cho `$GITHUB_OUTPUT`.
+**d. Bước đọc metrics cũ luôn ra rỗng (Bonus 4).** Trong phiên bản đầu, tôi `echo` giá trị output ngay trong chính step đặt nó. GitHub Actions đánh giá biểu thức `${{ }}` **trước** khi step chạy, nên biến luôn rỗng bất kể logic bên trong đúng hay sai. Đã tách phần thông báo ra khỏi `$GITHUB_OUTPUT` và chỉ đọc output đó ở step sau.
+
+**e. Health check "pass" giả do trùng port.** Khi test đường serving trên máy cá nhân, `curl /health` trả về `200 {"status":"ok","env":"development"}` — nhưng `src/serve.py` không hề trả về field `env`. Kiểm tra `lsof` thì thấy một process khác đã chiếm port 8000 từ trước; uvicorn của tôi chết ngay với `address already in use` còn `curl` thì trúng service kia.
+
+*Bài học:* health check chỉ dựa vào mã HTTP 200 là không đủ — nó xác nhận "có ai đó đang lắng nghe", không phải "service của tôi đang chạy". Đã thêm bước kiểm tra process của chính mình còn sống (`kill -0 $PID`) trước và trong vòng lặp retry, và in log uvicorn khi thất bại. Trên CI runner port luôn trống nên lỗi này không xảy ra, nhưng nếu deploy lên VM dùng chung thì đây đúng là tình huống gây nhầm lẫn nguy hiểm: pipeline báo xanh trong khi model mới chưa hề được load.
 
 ---
 
@@ -81,7 +96,7 @@ model_type: random_forest
 |---|---|
 | MLflow tracking, 20+ run | Đạt |
 | Unit test (3 test) | Pass, ổn định trong 3 môi trường |
-| DVC remote (DagsHub) | Đã cấu hình |
-| CI/CD 4 jobs | Test → Train → Eval → Deploy |
+| DVC remote (`./dvcstore`) | Đã cấu hình, `dvc pull` chạy trong CI |
+| CI/CD 4 jobs | Test → Train → Eval → Deploy, không cần tài khoản cloud |
 | Eval gate | Chặn đúng ở 0.68 < 0.70 |
 | Bonus 1–5 | Hoàn thành |

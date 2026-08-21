@@ -10,11 +10,6 @@ on:
   workflow_dispatch:
 
 env:
-  # DagsHub thay cho GCS: vua la DVC remote (S3-compatible) vua la MLflow server.
-  # Secrets can tao: DAGSHUB_USER, DAGSHUB_REPO, DAGSHUB_TOKEN
-  DAGSHUB_USER: ${{ secrets.DAGSHUB_USER }}
-  DAGSHUB_REPO: ${{ secrets.DAGSHUB_REPO }}
-  DAGSHUB_TOKEN: ${{ secrets.DAGSHUB_TOKEN }}
   EVAL_THRESHOLD: "0.70"
 
 jobs:
@@ -46,8 +41,11 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # JOB 2 - TRAIN
-  # Xac thuc cloud storage, pull du lieu bang DVC, huan luyen mo hinh, upload artifact.
+  # Pull du lieu bang DVC, huan luyen mo hinh, upload artifact.
   # Chi chay khi Job 1 (Unit Test) hoan thanh thanh cong.
+  #
+  # Luu tru: DVC remote la ./dvcstore ngay trong repo, model va metrics di qua
+  # GitHub Actions artifacts. Toan bo pipeline khong can tai khoan cloud nao.
   # ---------------------------------------------------------------------------
   train:
     name: Train
@@ -69,52 +67,42 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Authenticate to Cloud Storage
-        # TODO 2: Ghi credentials va set bien moi truong xac thuc.
-        # DagsHub dung S3-compatible API: access_key_id = secret_access_key = token.
-        # Ghi vao config --local de khong lam ban .dvc/config da commit.
+        # TODO 2: Xac thuc voi noi luu tru du lieu.
+        # DVC remote la mot thu muc trong repo (./dvcstore) nen khong can
+        # credentials. Buoc nay chi xac nhan cau hinh remote da dung.
         run: |
-          dvc remote modify --local myremote access_key_id  "$DAGSHUB_TOKEN"
-          dvc remote modify --local myremote secret_access_key "$DAGSHUB_TOKEN"
-          # MLflow tracking tu xa tren DagsHub (Bonus 1)
-          echo "MLFLOW_TRACKING_URI=https://dagshub.com/$DAGSHUB_USER/$DAGSHUB_REPO.mlflow" >> $GITHUB_ENV
-          echo "MLFLOW_TRACKING_USERNAME=$DAGSHUB_USER" >> $GITHUB_ENV
-          echo "MLFLOW_TRACKING_PASSWORD=$DAGSHUB_TOKEN" >> $GITHUB_ENV
+          dvc remote list
+          dvc config core.remote
+
+      - name: Restore previous metrics
+        # Bonus 4: lay metrics.json cua lan chay truoc tu GitHub Actions cache.
+        # Phai lam TRUOC khi train, neu khong se doc lai chinh ket qua vua tao.
+        uses: actions/cache/restore@v4
+        with:
+          path: .prev_metrics
+          key: metrics-${{ github.run_id }}
+          restore-keys: |
+            metrics-
+
+      - name: Read previous accuracy
+        id: prev_metrics
+        # Lan chay dau tien chua co cache -> prev_accuracy de trong, khong la loi.
+        run: |
+          if [ -f .prev_metrics/metrics.json ]; then
+            PREV=$(python -c "import json; print(json.load(open('.prev_metrics/metrics.json'))['accuracy'])")
+            echo "prev_accuracy=$PREV" >> $GITHUB_OUTPUT
+            echo "Tim thay model truoc, accuracy=$PREV"
+          else
+            echo "prev_accuracy=" >> $GITHUB_OUTPUT
+            echo "Chua co model truoc - bo qua so sanh."
+          fi
 
       - name: Pull data with DVC
-        # TODO 3: Pull cac file du lieu can thiet tu cloud storage bang lenh dvc pull.
+        # TODO 3: Pull cac file du lieu can thiet tu remote bang lenh dvc pull.
         #         Chi pull train_phase1.csv va eval.csv (khong can train_phase2.csv).
-        run: dvc pull data/train_phase1.csv data/eval.csv
-
-      - name: Download previous metrics
-        id: prev_metrics
-        # Bonus 4: tai metrics.json cua lan chay truoc de so sanh sau khi train.
-        # Phai lam TRUOC buoc upload, neu khong se doc lai chinh model vua day len.
-        # Lan chay dau tien chua co file -> prev_accuracy de trong, khong coi la loi.
         run: |
-          python - <<'EOF' >> $GITHUB_OUTPUT
-          import boto3, os, json, sys
-          from botocore.exceptions import ClientError
-
-          user, repo, token = (os.environ["DAGSHUB_USER"],
-                               os.environ["DAGSHUB_REPO"],
-                               os.environ["DAGSHUB_TOKEN"])
-          client = boto3.client(
-              "s3",
-              endpoint_url=f"https://dagshub.com/api/v1/repo-buckets/s3/{user}",
-              aws_access_key_id=token,
-              aws_secret_access_key=token,
-              region_name="us-east-1",
-          )
-          try:
-              obj = client.get_object(Bucket=repo, Key="models/latest/metrics.json")
-              prev = json.loads(obj["Body"].read())
-              print(f"prev_accuracy={prev['accuracy']}")
-              print(f"Tim thay model truoc, accuracy={prev['accuracy']}", file=sys.stderr)
-          except ClientError as e:
-              print("prev_accuracy=")
-              print(f"Chua co model truoc ({e.response['Error']['Code']}) - bo qua so sanh.",
-                    file=sys.stderr)
-          EOF
+          dvc pull data/train_phase1.csv data/eval.csv
+          wc -l data/train_phase1.csv data/eval.csv
 
       - name: Train model
         run: python src/train.py
@@ -129,35 +117,17 @@ jobs:
           echo "Accuracy doc duoc: $ACC"
 
       - name: Show performance report
-        # Bonus 3: in bao cao confusion matrix + precision/recall vao log pipeline.
+        # Bonus 3: in confusion matrix + precision/recall vao log pipeline.
         run: cat outputs/report.txt
 
-      - name: Upload model to Cloud Storage
-        # TODO 5: Upload models/model.pkl len <bucket>/models/latest/model.pkl.
-        #         DagsHub repo bucket: bucket = ten repo, endpoint = repo-buckets/s3/<user>.
-        #         Upload ca metrics.json de lan chay sau so sanh duoc (Bonus 4).
-        run: |
-          python - <<'EOF'
-          import boto3, os
-
-          user, repo, token = (os.environ["DAGSHUB_USER"],
-                               os.environ["DAGSHUB_REPO"],
-                               os.environ["DAGSHUB_TOKEN"])
-          client = boto3.client(
-              "s3",
-              endpoint_url=f"https://dagshub.com/api/v1/repo-buckets/s3/{user}",
-              aws_access_key_id=token,
-              aws_secret_access_key=token,
-              region_name="us-east-1",
-          )
-          for local, key in [
-              ("models/model.pkl",     "models/latest/model.pkl"),
-              ("outputs/metrics.json", "models/latest/metrics.json"),
-              ("outputs/report.txt",   "models/latest/report.txt"),
-          ]:
-              client.upload_file(Filename=local, Bucket=repo, Key=key)
-              print(f"Da upload {local} ({os.path.getsize(local)/1e6:.1f} MB) -> {repo}/{key}")
-          EOF
+      - name: Upload model to storage
+        # TODO 5: Day model len noi luu tru de job deploy va lan chay sau dung lai.
+        #         Dung GitHub Actions artifacts (mien phi, khong can tai khoan cloud).
+        uses: actions/upload-artifact@v4
+        with:
+          name: model
+          path: models/model.pkl
+          retention-days: 30
 
       - name: Save metrics as artifact
         # Bonus 3: luu ca report.txt canh metrics.json.
@@ -167,6 +137,17 @@ jobs:
           path: |
             outputs/metrics.json
             outputs/report.txt
+
+      - name: Cache metrics for next run
+        # Bonus 4: ghi metrics moi vao cache de lan chay sau so sanh duoc.
+        run: |
+          mkdir -p .prev_metrics
+          cp outputs/metrics.json .prev_metrics/metrics.json
+
+      - uses: actions/cache/save@v4
+        with:
+          path: .prev_metrics
+          key: metrics-${{ github.run_id }}
 
 
   # ---------------------------------------------------------------------------
@@ -209,8 +190,7 @@ jobs:
           # Cong 2 (Bonus 4): khong duoc kem hon model dang chay
           if prev_raw:
               prev = float(prev_raw)
-              delta = acc - prev
-              print(f"Accuracy cu  : {prev:.4f}  (thay doi: {delta:+.4f})")
+              print(f"Accuracy cu  : {prev:.4f}  (thay doi: {acc - prev:+.4f})")
               if acc < prev:
                   failures.append(f"accuracy {acc:.4f} thap hon model dang chay {prev:.4f}")
           else:
@@ -226,8 +206,12 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # JOB 4 - DEPLOY
-  # Trien khai len VM qua SSH.
+  # Trien khai va xac nhan endpoint tra ve ket qua dung.
   # Chi chay khi Job 3 (Eval) hoan thanh thanh cong.
+  #
+  # Neu co secret VM_HOST -> deploy len VM that qua SSH (kien truc goc cua lab).
+  # Neu chua co VM -> khoi dong FastAPI ngay tren runner va goi /health + /predict
+  # de chung minh duong serving hoat dong dau-cuoi.
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy
@@ -237,15 +221,16 @@ jobs:
 
       - name: Check VM secrets
         id: check_vm
-        # Neu chua co VM, job nay bao qua thay vi that bai do (giu pipeline xanh).
         run: |
           if [ -n "${{ secrets.VM_HOST }}" ]; then
             echo "has_vm=true" >> $GITHUB_OUTPUT
+            echo "Co VM_HOST - deploy len VM qua SSH."
           else
             echo "has_vm=false" >> $GITHUB_OUTPUT
-            echo "Chua cau hinh secret VM_HOST - bo qua buoc SSH deploy."
+            echo "Chua co VM_HOST - xac minh serving tren runner."
           fi
 
+      # --- Duong 1: VM that qua SSH ---
       - name: SSH deploy to VM
         if: steps.check_vm.outputs.has_vm == 'true'
         uses: appleboy/ssh-action@v1.0.3
@@ -270,3 +255,109 @@ jobs:
             echo "Health check that bai sau 12 lan thu."
             sudo journalctl -u mlops-serve -n 50 --no-pager
             exit 1
+
+      # --- Duong 2: xac minh serving tren runner ---
+      - uses: actions/checkout@v4
+        if: steps.check_vm.outputs.has_vm == 'false'
+
+      - uses: actions/setup-python@v5
+        if: steps.check_vm.outputs.has_vm == 'false'
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.check_vm.outputs.has_vm == 'false'
+        run: pip install -r requirements.txt
+
+      - name: Download model
+        if: steps.check_vm.outputs.has_vm == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: model
+          path: models
+
+      - name: Start FastAPI server
+        if: steps.check_vm.outputs.has_vm == 'false'
+        run: |
+          nohup python -m uvicorn src.serve:app --host 127.0.0.1 --port 8000 \
+            > uvicorn.log 2>&1 &
+          echo $! > uvicorn.pid
+          sleep 2
+          # Neu port bi chiem, uvicorn chet ngay ma curl van co the trung mot
+          # service khac dang lang nghe -> health check "pass" gia. Kiem tra
+          # process cua chinh minh con song truoc khi tin ket qua curl.
+          if ! kill -0 "$(cat uvicorn.pid)" 2>/dev/null; then
+            echo "Server chet ngay khi khoi dong:"
+            cat uvicorn.log
+            exit 1
+          fi
+
+      - name: Health check
+        # TODO 8: Cho server san sang roi goi /health de xac nhan.
+        if: steps.check_vm.outputs.has_vm == 'false'
+        run: |
+          for i in $(seq 1 12); do
+            if curl -sf http://127.0.0.1:8000/health; then
+              echo ""
+              echo "Health check passed (lan thu $i)."
+              exit 0
+            fi
+            if ! kill -0 "$(cat uvicorn.pid)" 2>/dev/null; then
+              echo "Server da chet. Log uvicorn:"
+              cat uvicorn.log
+              exit 1
+            fi
+            echo "Chua san sang, thu lai sau 5s... ($i/12)"
+            sleep 5
+          done
+          echo "Health check that bai sau 12 lan thu. Log uvicorn:"
+          cat uvicorn.log
+          exit 1
+
+      - name: Verify prediction endpoint
+        if: steps.check_vm.outputs.has_vm == 'false'
+        run: |
+          dvc pull data/eval.csv
+          python - <<'EOF'
+          import json, urllib.request
+          import pandas as pd
+
+          ev = pd.read_csv("data/eval.csv")
+          ok = 0
+          for i in range(5):
+              row = ev.drop(columns=["target"]).iloc[i].tolist()
+              req = urllib.request.Request(
+                  "http://127.0.0.1:8000/predict",
+                  data=json.dumps({"features": row}).encode(),
+                  headers={"Content-Type": "application/json"},
+              )
+              out = json.loads(urllib.request.urlopen(req).read())
+              truth = int(ev["target"].iloc[i])
+              hit = "dung" if out["prediction"] == truth else "sai"
+              print(f"mau {i}: du doan={out['prediction']} ({out['label']:<11}) "
+                    f"nhan that={truth}  -> {hit}")
+              assert out["prediction"] in (0, 1, 2)
+              assert out["label"] in ("thap", "trung_binh", "cao")
+              ok += out["prediction"] == truth
+
+          # Kiem tra endpoint tu choi dau vao sai so luong dac trung
+          req = urllib.request.Request(
+              "http://127.0.0.1:8000/predict",
+              data=json.dumps({"features": [1.0, 2.0, 3.0]}).encode(),
+              headers={"Content-Type": "application/json"},
+          )
+          try:
+              urllib.request.urlopen(req)
+              raise SystemExit("FAILED: endpoint khong tu choi dau vao 3 dac trung.")
+          except urllib.error.HTTPError as e:
+              assert e.code == 400, f"mong doi 400, nhan {e.code}"
+              print("\nValidation OK: 3 dac trung -> HTTP 400.")
+
+          print(f"Endpoint hoat dong dung. Du doan chinh xac {ok}/5 mau.")
+          EOF
+
+      - name: Stop server
+        if: always() && steps.check_vm.outputs.has_vm == 'false'
+        run: |
+          [ -f uvicorn.pid ] && kill "$(cat uvicorn.pid)" || true
